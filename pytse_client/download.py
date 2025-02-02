@@ -155,6 +155,88 @@ def download(
     return df_list
 
 
+def update(
+    symbols: Union[List, str],
+    write_to_csv: bool = False,
+    include_jdate: bool = False,
+    base_path: str = config.DATA_BASE_PATH,
+    adjust: bool = False,
+) -> Dict[str, pd.DataFrame]:
+    if symbols == "all":
+        symbols = symbols_data.all_symbols()
+    elif isinstance(symbols, str):
+        symbols = [symbols]
+
+    df_list = {}
+    future_to_symbol = {}
+    with futures.ThreadPoolExecutor(max_workers=10) as executor:
+        session = requests_retry_session()
+        for symbol in symbols:
+            if (
+                symbol.isnumeric()
+                and symbols_data.get_ticker_index(symbol) is None
+            ):
+                ticker_indexes = [symbol]
+            else:
+                ticker_index = _handle_ticker_index(symbol)
+                if ticker_index is None:
+                    raise Exception(f"Cannot find symbol: {symbol}")
+                ticker_indexes = symbols_data.get_ticker_old_index(symbol)
+                ticker_indexes.insert(0, ticker_index)
+
+            for index in ticker_indexes:
+                future = executor.submit(
+                    download_ticker_daily_record, index, session
+                )
+
+                future_to_symbol[future] = symbol
+
+        for future in futures.as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                df: pd.DataFrame = future.result()
+            except pd.errors.EmptyDataError as ex:
+                logger.error(
+                    f"Cannot read daily trade records for symbol: {symbol}",
+                    extra={"Error": ex},
+                )
+                continue
+            df = df.iloc[::-1].reset_index(drop=True)
+            df = df.rename(columns=translations.HISTORY_FIELD_MAPPINGS)
+            df = df.drop(columns=["<PER>", "<TICKER>"])
+            _adjust_data_frame(df, include_jdate)
+
+            if symbol in df_list:
+                df_list[symbol] = (
+                    pd.concat(
+                        [df_list[symbol], df], ignore_index=True, sort=False
+                    )
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
+            else:
+                df_list[symbol] = df
+
+            if adjust:
+                df_list[symbol] = adjust_price(df_list[symbol])
+
+            if write_to_csv:
+                Path(base_path).mkdir(parents=True, exist_ok=True)
+                if adjust:
+                    df_list[symbol].to_csv(
+                        f"{base_path}/{symbol}-ت.csv", index=False
+                    )
+                else:
+                    df_list[symbol].to_csv(
+                        f"{base_path}/{symbol}.csv", index=False
+                    )
+
+    if len(df_list) != len(symbols):
+        print("Warning, download did not complete, re-run the code")
+    session.close()
+    return df_list
+
+
 def adjust_price(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adjust historical records of stock
